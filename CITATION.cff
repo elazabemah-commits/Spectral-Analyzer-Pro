@@ -1,0 +1,34 @@
+cff-version: 1.2.0
+message: "If you use Spectral Analyzer Pro in your research, please cite it as follows."
+title: "Spectral Analyzer Pro: A desktop application for chemometrics and QSAR analysis of spectral data"
+authors:
+  - family-names: Khaled
+    given-names: Abdelhalim
+    affiliation: "University of Concepción, Plant Ecophysiology"
+year: 2026
+repository-code: "https://github.com/elazabemah-commits/Spectral-Analyzer-Pro"
+url: "https://github.com/elazabemah-commits/Spectral-Analyzer-Pro"
+license: MIT
+keywords:
+  - chemometrics
+  - QSAR
+  - spectroscopy
+  - PLSR
+  - machine learning
+  - NIR
+type: software
+abstract: >-
+  Spectral Analyzer Pro is a desktop application for chemometrics and QSAR
+  analysis of spectral data. It supports preprocessing, collinearity reduction,
+  leak-free cross-validation, multiple regression models, Golbraikh-Tropsha
+  criteria, SHAP explanations, and Excel report export.
+preferred-citation:
+  type: software
+  title: "Spectral Analyzer Pro: A desktop application for chemometrics and QSAR analysis of spectral data"
+  authors:
+    - family-names: Khaled
+      given-names: Abdelhalim
+      affiliation: "University of Concepción, Plant Ecophysiology"
+  year: 2026
+  url: "https://github.com/elazabemah-commits/Spectral-Analyzer-Pro"
+  repository-code: "https://github.com/elazabemah-commits/Spectral-Analyzer-Pro"

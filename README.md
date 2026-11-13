@@ -53,3 +53,21 @@ python SpecPro.py
 Dr. Abdelhalim Khaled  
 Plant Ecophysiology  
 University of Concepción
+
+## Citation
+
+If you use Spectral Analyzer Pro in your research, please cite:
+
+> Khaled, A. (2026). *Spectral Analyzer Pro: A desktop application for chemometrics and QSAR analysis of spectral data*. University of Concepción. https://github.com/elazabemah-commits/Spectral-Analyzer-Pro
+
+BibTeX:
+
+```bibtex
+@software{khaled2026spectral,
+  author       = {Khaled, Abdelhalim},
+  title        = {Spectral Analyzer Pro: A desktop application for chemometrics and QSAR analysis of spectral data},
+  year         = {2026},
+  publisher    = {University of Concepción},
+  url          = {https://github.com/elazabemah-commits/Spectral-Analyzer-Pro}
+}
+```

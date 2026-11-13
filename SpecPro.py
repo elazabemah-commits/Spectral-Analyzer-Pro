@@ -2170,6 +2170,16 @@ class SpectralAnalyzerApp:
             "Plant Ecophysiology",
             "University of Concepción",
             "",
+            "================================================================================",
+            "CITATION",
+            "--------------------------------------------------------------------------------",
+            "If you use Spectral Analyzer Pro in your research, please cite:",
+            "",
+            "Khaled, A. (2026). Spectral Analyzer Pro: A desktop application for",
+            "chemometrics and QSAR analysis of spectral data.",
+            "University of Concepción.",
+            "https://github.com/elazabemah-commits/Spectral-Analyzer-Pro",
+            "",
             "================================================================================"
         ]
         about_text.insert(tk.END, "\n".join(about_lines))
@@ -3498,7 +3508,12 @@ class SpectralAnalyzerApp:
             "and export of full Excel reports.\n\n"
             "Developed by Dr. Abdelhalim Khaled\n"
             "Plant Ecophysiology\n"
-            "University of Concepción"
+            "University of Concepción\n\n"
+            "Citation:\n"
+            "Khaled, A. (2026). Spectral Analyzer Pro: A desktop application for\n"
+            "chemometrics and QSAR analysis of spectral data.\n"
+            "University of Concepción.\n"
+            "https://github.com/elazabemah-commits/Spectral-Analyzer-Pro"
         )
         messagebox.showinfo("About Spectral Analyzer Pro", about_text, parent=self.root)
 
