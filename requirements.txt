@@ -1,0 +1,9 @@
+numpy
+pandas
+scikit-learn
+scipy
+matplotlib
+openpyxl
+pillow
+joblib
+threadpoolctl
