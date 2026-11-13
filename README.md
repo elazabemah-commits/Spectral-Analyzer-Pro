@@ -54,6 +54,13 @@ Dr. Abdelhalim Khaled
 Plant Ecophysiology  
 University of Concepción
 
+
+## User Manual
+
+A full user manual (all buttons, statistics, parameters, and functions) is included:
+
+[Spectral_Analyzer_Pro_User_Manual.docx](Spectral_Analyzer_Pro_User_Manual.docx)
+
 ## Citation
 
 If you use Spectral Analyzer Pro in your research, please cite:
