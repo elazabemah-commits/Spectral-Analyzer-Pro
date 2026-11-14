@@ -17,6 +17,8 @@ while keeping this file as the single entry point.
 
 import sys
 import os
+import threading
+import queue
 
 # Frozen one-file builds have no installed Python. Point Matplotlib at a
 # writable folder before it is imported, or the window can fail to open.
@@ -434,35 +436,61 @@ def golbraikh_tropsha_criteria(y_true, y_pred):
     }
 
 def stepwise_regression_fit(X, y, max_vars=15, p_enter=0.05, p_remove=0.10):
-    """Forward-Backward Stepwise MLR with safer defaults and BIC early-stopping for small samples.
-    - max_vars capped near n/5 (stricter when n is very small).
-    - p_enter stricter on small n.
-    - BIC check prevents adding variables that do not improve the information criterion.
+    """Stabilized forward-backward stepwise MLR for small samples.
+    - Strict variable caps (n//8, max 2 below n=30, max 3 below n=50).
+    - Stricter p-enter on small n.
+    - BIC (with extra penalty on small n) must improve.
+    - On n < 50 the candidate must also improve a quick internal CV Q²
+      (reduces the classic stepwise optimism on tiny samples).
     - Falls back to the single strongest univariate predictor if nothing enters.
     """
     n_samples, n_features = X.shape
     y_flat = y.ravel()
 
-    # Safer limits based on sample size
-    safe_max = max(1, min(max_vars, max(1, n_samples // 5), n_features))
+    # Stricter caps
+    safe_max = max(1, min(max_vars, max(1, n_samples // 8), n_features))
     if n_samples < 30:
-        safe_max = min(safe_max, 3)
+        safe_max = min(safe_max, 2)
     elif n_samples < 50:
-        safe_max = min(safe_max, 5)
+        safe_max = min(safe_max, 3)
+    elif n_samples < 80:
+        safe_max = min(safe_max, 4)
 
     effective_p_enter = p_enter
     if n_samples < 40:
-        effective_p_enter = min(p_enter, 0.01)
+        effective_p_enter = min(p_enter, 0.005)
     elif n_samples < 80:
-        effective_p_enter = min(p_enter, 0.025)
+        effective_p_enter = min(p_enter, 0.02)
+
+    # Extra BIC penalty on small n (makes inclusion harder)
+    bic_extra = 2.0 if n_samples < 40 else (1.0 if n_samples < 80 else 0.0)
+    use_cv_gate = n_samples >= 12 and n_samples < 50
 
     current_features = []
     best_bic = np.inf
+    best_cv = -np.inf
+
+    def _quick_cv(feats):
+        if len(feats) == 0 or n_samples < 8:
+            return -np.inf
+        try:
+            n_splits = min(3, max(2, n_samples // 6))
+            cv = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+            y_hat = np.zeros_like(y_flat)
+            Xf = X[:, feats]
+            for tr, va in cv.split(Xf):
+                lr = LinearRegression()
+                lr.fit(Xf[tr], y_flat[tr])
+                y_hat[va] = lr.predict(Xf[va])
+            return float(r2_score(y_flat, y_hat)) if np.std(y_flat) > 0 else -np.inf
+        except Exception:
+            return -np.inf
 
     for step in range(safe_max):
         best_pval = 1.0
         best_feature = -1
         best_trial_bic = np.inf
+        best_trial_cv = -np.inf
 
         remaining = [f for f in range(n_features) if f not in current_features]
         for f in remaining:
@@ -478,27 +506,39 @@ def stepwise_regression_fit(X, y, max_vars=15, p_enter=0.05, p_remove=0.10):
             df = n_samples - len(trial_features) - 1
             if df <= 0 or rss <= 0:
                 continue
-            # BIC = n*ln(RSS/n) + k*ln(n)
             k = len(trial_features) + 1
-            bic = n_samples * np.log(rss / n_samples) + k * np.log(n_samples)
+            bic = n_samples * np.log(rss / n_samples) + (k + bic_extra) * np.log(n_samples)
             s2 = rss / df
             try:
-                XTX_inv = np.linalg.pinv(np.dot(X_design.T, X_design))
-                se = np.sqrt(np.maximum(0, np.diagonal(s2 * XTX_inv)))
-                t_stats = np.append([lr.intercept_], lr.coef_) / (se + 1e-8)
+                XTX = np.dot(X_design.T, X_design)
+                XTX_inv = np.linalg.pinv(XTX)
+                se = np.sqrt(np.maximum(0.0, np.diagonal(s2 * XTX_inv)))
+                coefs_full = np.append([lr.intercept_], lr.coef_)
+                if len(se) != len(coefs_full):
+                    continue
+                t_stats = coefs_full / (se + 1e-8)
                 p_vals = 2 * (1 - t.cdf(np.abs(t_stats), df))
-                p_val = p_vals[-1]
-                if p_val < best_pval and bic < best_trial_bic:
-                    best_pval = p_val
-                    best_feature = f
-                    best_trial_bic = bic
+                p_val = float(p_vals[-1])
+                if not (np.isfinite(p_val) and p_val < best_pval and bic < best_trial_bic):
+                    continue
+                # CV gate on small n
+                if use_cv_gate:
+                    cv_score = _quick_cv(trial_features)
+                    if cv_score < best_cv - 1e-4:
+                        continue
+                    best_trial_cv = cv_score
+                best_pval = p_val
+                best_feature = f
+                best_trial_bic = bic
             except Exception:
                 continue
 
-        # Only add if p-value passes AND BIC improves
+        # Only add if p-value, BIC, and (on small n) CV all improve
         if best_feature != -1 and best_pval <= effective_p_enter and best_trial_bic < best_bic:
             current_features.append(best_feature)
             best_bic = best_trial_bic
+            if use_cv_gate:
+                best_cv = best_trial_cv
         else:
             break
 
@@ -666,21 +706,37 @@ def calculate_vip(pls_model, X, y):
     """Calculate Variable Importance in Projection (VIP) scores for a fitted PLS model.
     
     VIP_j = sqrt( p * sum_a (SS_a * w_aj^2) / sum_a SS_a )
-    where SS_a is the variance explained by component a.
+    where SS_a = ||t_a||^2 * q_a^2 is the variance explained in y by component a.
+    
+    Handles sklearn PLSRegression shapes correctly:
+      x_scores_    : (n_samples, n_components)
+      x_weights_   : (n_features, n_components)
+      y_loadings_  : (n_components, n_targets) or (n_components,)
     """
     try:
-        t = pls_model.x_scores_
-        w = pls_model.x_weights_
-        q = pls_model.y_loadings_
+        t = np.asarray(pls_model.x_scores_)
+        w = np.asarray(pls_model.x_weights_)
+        q = np.asarray(pls_model.y_loadings_)
         p = X.shape[1]
-        # Variance explained by each component
-        ss = np.sum(t ** 2, axis=0) * np.sum(q ** 2, axis=0)
+        n_comp = t.shape[1]
+        
+        # Per-component y-variance explained: ||t_a||^2 * q_a^2
+        t_norm2 = np.sum(t ** 2, axis=0)  # (n_comp,)
+        if q.ndim == 2:
+            # (n_components, n_targets) — sum over targets for multi-y, or take the single target
+            q2 = np.sum(q ** 2, axis=1)
+        else:
+            q2 = q.ravel() ** 2
+        if len(q2) != n_comp:
+            q2 = np.ones(n_comp)
+        ss = t_norm2 * q2
         total_ss = np.sum(ss)
-        if total_ss <= 0:
-            return np.ones(p) / p
+        if total_ss <= 0 or not np.isfinite(total_ss):
+            return np.ones(p) / max(p, 1)
+        
         vip = np.zeros(p)
         for j in range(p):
-            weight = np.array([(w[j, a] ** 2) * ss[a] for a in range(len(ss))])
+            weight = (w[j, :n_comp] ** 2) * ss
             vip[j] = np.sqrt(p * np.sum(weight) / total_ss)
         return vip
     except Exception:
@@ -747,8 +803,12 @@ def select_features_by_correlation(X, y, max_features=50, abs_corr_threshold=0.3
 
 
 def select_features_interval(X, y, interval_width=10, max_intervals=8, n_components=3):
-    """Simple interval selection: evaluate consecutive blocks with a quick PLS
-    and keep the best-performing intervals (a lightweight iPLS-style approach).
+    """Sequential forward interval PLS (practical forward iPLS).
+    Intervals are added one-by-one. At each step the interval that most improves
+    the leak-free K-fold Q² of the *combined* selected features is chosen.
+    This is the classic forward-iPLS procedure (not an independent top-k ranking).
+    Overlap is naturally limited because only intervals that improve the joint model
+    are kept. A full combinatorial search remains exponential and is not used.
     """
     X = np.asarray(X, dtype=float)
     y = np.asarray(y, dtype=float).ravel()
@@ -756,41 +816,71 @@ def select_features_interval(X, y, interval_width=10, max_intervals=8, n_compone
     if n_features <= interval_width or n_samples < 8:
         return np.ones(n_features, dtype=bool), None
 
-    scores = []
-    starts = list(range(0, n_features - interval_width + 1, max(1, interval_width // 2)))
-    for start in starts:
-        end = start + interval_width
-        X_int = X[:, start:end]
-        try:
-            sc = StandardScaler()
-            Xs = sc.fit_transform(X_int)
-            nc = max(1, min(n_components, n_samples - 2, interval_width))
-            pls = SafePLSRegression(max_components=nc)
-            # Quick internal score
-            if n_samples >= 12:
-                tr, va = train_test_split(np.arange(n_samples), test_size=0.3, random_state=42)
-                pls.fit(Xs[tr], y[tr])
-                pred = pls.predict(Xs[va])
-                q = r2_score(y[va], pred) if np.std(y[va]) > 0 else -np.inf
-            else:
-                pls.fit(Xs, y)
-                q = r2_score(y, pls.predict(Xs))
-            scores.append((q, start, end))
-        except Exception:
-            scores.append((-np.inf, start, end))
+    n_splits = min(3, max(2, n_samples // 6))
+    cv = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+    step = max(1, interval_width // 2)
+    intervals = [(s, s + interval_width) for s in range(0, n_features - interval_width + 1, step)]
 
-    scores.sort(reverse=True)
+    def _cv_score(mask):
+        """Leak-free K-fold Q² of the features indicated by mask."""
+        if mask.sum() < 2:
+            return -np.inf
+        X_sub = X[:, mask]
+        y_hat = np.zeros_like(y, dtype=float)
+        try:
+            for tr_idx, va_idx in cv.split(X_sub):
+                sc = StandardScaler()
+                Xtr = sc.fit_transform(X_sub[tr_idx])
+                Xva = sc.transform(X_sub[va_idx])
+                nc = max(1, min(n_components, len(tr_idx) - 1, X_sub.shape[1]))
+                pls = SafePLSRegression(max_components=nc)
+                pls.fit(Xtr, y[tr_idx])
+                y_hat[va_idx] = pls.predict(Xva)
+            return float(r2_score(y, y_hat)) if np.std(y) > 0 else -np.inf
+        except Exception:
+            return -np.inf
+
     selected = np.zeros(n_features, dtype=bool)
-    kept = 0
-    for q, start, end in scores:
-        if kept >= max_intervals:
-            break
-        if q > -np.inf:
-            selected[start:end] = True
-            kept += 1
+    history = []
+    best_score = -np.inf
+
+    for _ in range(max_intervals):
+        best_gain = -np.inf
+        best_interval = None
+        for start, end in intervals:
+            # Skip intervals that add almost no new features
+            if selected[start:end].all():
+                continue
+            trial = selected.copy()
+            trial[start:end] = True
+            score = _cv_score(trial)
+            gain = score - best_score
+            if score > best_score and gain > best_gain:
+                best_gain = gain
+                best_interval = (start, end, score)
+        if best_interval is None or best_gain <= 1e-4:
+            break  # no meaningful improvement
+        start, end, score = best_interval
+        selected[start:end] = True
+        best_score = score
+        history.append((score, start, end))
+
     if selected.sum() == 0:
-        selected[:] = True
-    return selected, scores
+        # Fallback: single best interval by itself
+        best_single = (-np.inf, 0, interval_width)
+        for start, end in intervals:
+            trial = np.zeros(n_features, dtype=bool)
+            trial[start:end] = True
+            sc = _cv_score(trial)
+            if sc > best_single[0]:
+                best_single = (sc, start, end)
+        if best_single[0] > -np.inf:
+            selected[best_single[1]:best_single[2]] = True
+            history.append(best_single)
+        else:
+            selected[:] = True
+
+    return selected, history
 
 
 def evaluate_q2_cv(model_name, X_raw, y, cv_folds=5, seed=42, alpha=None, n_components=None,
@@ -938,11 +1028,15 @@ def _select_tree_params_light(model_name, X, y, seed=42, full=False):
     return best_params
 
 
-def select_best_alpha(model_type, X, y, seed=42):
+def select_best_alpha(model_type, X, y, seed=42, fast=False):
     """Grid search for Ridge/Lasso/ElasticNet alpha using 3-fold CV on training data.
     Uses joblib for parallel evaluation of the alpha grid when beneficial.
+    fast=True uses a smaller grid for speed.
     """
-    alphas = [1e-4, 1e-3, 0.01, 0.1, 0.5, 1.0, 5.0, 10.0, 50.0, 100.0]
+    if fast:
+        alphas = [1e-3, 0.01, 0.1, 1.0, 10.0]
+    else:
+        alphas = [1e-4, 1e-3, 0.01, 0.1, 0.5, 1.0, 5.0, 10.0, 50.0, 100.0]
     best_alpha = 1.0
     best_q2 = -np.inf
     n_splits = min(3, max(2, len(y) // 5))
@@ -1147,7 +1241,8 @@ class ClosedPipeline:
     and can transform + predict new raw spectra.
     """
     def __init__(self, model, scaler, feature_names, preprocessing,
-                 sg_window=15, sg_poly=2, msc_reference=None, mean_centering_mean=None):
+                 sg_window=15, sg_poly=2, msc_reference=None, mean_centering_mean=None,
+                 original_feature_names=None):
         self.model = model
         self.scaler = scaler
         self.feature_names = list(feature_names)
@@ -1156,6 +1251,8 @@ class ClosedPipeline:
         self.sg_poly = sg_poly
         self.msc_reference = msc_reference
         self.mean_centering_mean = mean_centering_mean
+        # Full column list before feature selection (used for row-wise methods)
+        self.original_feature_names = list(original_feature_names) if original_feature_names is not None else list(feature_names)
 
     def transform(self, df_new):
         feats = self.feature_names
@@ -1175,15 +1272,41 @@ class ClosedPipeline:
 
         if self.preprocessing == "Mean Centering" and self.mean_centering_mean is not None:
             X_raw = work.values
-            X_proc = pd.DataFrame(X_raw - self.mean_centering_mean, columns=present, index=work.index)
+            mc = np.asarray(self.mean_centering_mean, dtype=float).ravel()
+            if len(mc) != X_raw.shape[1]:
+                raise ValueError(
+                    f"Mean-centering reference length ({len(mc)}) does not match "
+                    f"selected features ({X_raw.shape[1]}). Re-save the model with the current version."
+                )
+            X_proc = pd.DataFrame(X_raw - mc, columns=present, index=work.index)
         elif self.preprocessing == "Multiplicative Scatter Correction (MSC)" and self.msc_reference is not None:
             X_raw = work.values
-            X_msc = apply_msc(X_raw, self.msc_reference)
+            ref = np.asarray(self.msc_reference, dtype=float).ravel()
+            if len(ref) != X_raw.shape[1]:
+                raise ValueError(
+                    f"MSC reference length ({len(ref)}) does not match "
+                    f"selected features ({X_raw.shape[1]}). Re-save the model with the current version."
+                )
+            X_msc = apply_msc(X_raw, ref)
             X_proc = pd.DataFrame(X_msc, columns=present, index=work.index)
         else:
-            X_proc_df = apply_preprocessing(work, method=self.preprocessing,
-                                            sg_window=self.sg_window, sg_poly=self.sg_poly)
-            X_proc = X_proc_df[present].apply(pd.to_numeric, errors="coerce")
+            # Prefer full-spectrum preprocessing then subset (correct for row-wise methods such as SNV, SG, detrend)
+            orig = getattr(self, "original_feature_names", None) or present
+            full_present = [c for c in orig if c in df_new.columns]
+            if len(full_present) >= len(present) and set(present).issubset(set(full_present)):
+                full_work = df_new[full_present].copy()
+                for col in full_work.columns:
+                    if full_work[col].dtype == object:
+                        full_work[col] = full_work[col].astype(str).str.replace(",", ".", regex=False)
+                full_work = full_work.apply(pd.to_numeric, errors="coerce")
+                X_full = apply_preprocessing(full_work, method=self.preprocessing,
+                                             sg_window=self.sg_window, sg_poly=self.sg_poly)
+                X_proc = X_full[present].apply(pd.to_numeric, errors="coerce")
+            else:
+                # Fallback: apply only to the selected columns (approximation)
+                X_proc_df = apply_preprocessing(work, method=self.preprocessing,
+                                                sg_window=self.sg_window, sg_poly=self.sg_poly)
+                X_proc = X_proc_df[present].apply(pd.to_numeric, errors="coerce")
         # Drop rows that still contain NaN after conversion
         good = X_proc.notna().all(axis=1)
         X_proc = X_proc.loc[good]
@@ -1872,6 +1995,13 @@ class SpectralAnalyzerApp:
                         command=lambda: self._log(f"Full nested CV set to: {self.full_nested_var.get()}")
                         ).pack(side=tk.LEFT, padx=(10, 2))
 
+        ttk.Label(row1, text="Speed:").pack(side=tk.LEFT, padx=(12, 2))
+        self.speed_mode_var = tk.StringVar(value="Fast")
+        speed_cb = ttk.Combobox(row1, textvariable=self.speed_mode_var, values=["Fast", "Full"],
+                                width=6, state="readonly")
+        speed_cb.pack(side=tk.LEFT, padx=2)
+        speed_cb.bind("<<ComboboxSelected>>", lambda e: self._log(f"Speed mode set to: {self.speed_mode_var.get()}"))
+
         # Row 2: Main actions
         row2 = ttk.Frame(control_frame)
         row2.pack(fill=tk.X, pady=(2, 0))
@@ -2170,16 +2300,6 @@ class SpectralAnalyzerApp:
             "Plant Ecophysiology",
             "University of Concepción",
             "",
-            "================================================================================",
-            "CITATION",
-            "--------------------------------------------------------------------------------",
-            "If you use Spectral Analyzer Pro in your research, please cite:",
-            "",
-            "Khaled, A. (2026). Spectral Analyzer Pro: A desktop application for",
-            "chemometrics and QSAR analysis of spectral data.",
-            "University of Concepción.",
-            "https://github.com/elazabemah-commits/Spectral-Analyzer-Pro",
-            "",
             "================================================================================"
         ]
         about_text.insert(tk.END, "\n".join(about_lines))
@@ -2393,7 +2513,7 @@ class SpectralAnalyzerApp:
         if n_train_est < 30:
             rec = ("⚠️ Very small sample size.\n"
                    "Recommended: PLSR, PCR, Ridge, ElasticNet.\n"
-                   "Stepwise MLR is available but ElasticNet is preferred.\n"
+                   "Stepwise MLR is available but usually less stable than ElasticNet/PLSR here.\n"
                    "Avoid: Random Forest, Extra Trees, Gradient Boosting, MLP, Gaussian Process.")
             color = "darkred"
         elif n_train_est < 60:
@@ -2428,11 +2548,19 @@ class SpectralAnalyzerApp:
         # Pre-select recommended ones
         recommended = set()
         if n_train_est < 30:
-            recommended = {"PLSR (5 LV max)", "PCR (5 PC + OLS)", "Ridge", "Stepwise MLR"}
+            recommended = {"PLSR (5 LV max)", "PCR (5 PC + OLS)", "Ridge", "ElasticNet"}
+        elif n_train_est < 40:
+            recommended = {"PLSR (5 LV max)", "PCR (5 PC + OLS)", "Ridge", "Lasso", "ElasticNet"}
         elif n_train_est < 60:
             recommended = {"PLSR (5 LV max)", "PCR (5 PC + OLS)", "Ridge", "Lasso", "ElasticNet", "Stepwise MLR"}
         else:
             recommended = set(all_models)  # all ok, but user can deselect
+
+        # Explicit warning and default-off for Stepwise on very small n
+        if n_train_est < 40:
+            rec += ("\n\n⚠️ Stepwise MLR is unchecked by default. "
+                    "It now uses a CV gate + extra BIC penalty, but ElasticNet/PLSR "
+                    "are still more stable on small n. You may force Stepwise on if needed.")
 
         vars_dict = {}
         for m in all_models:
@@ -2491,7 +2619,46 @@ class SpectralAnalyzerApp:
         self.status_var.set("Preprocessing data, eliminating collinearity, and training models...")
         self.root.update_idletasks()
 
+        # Capture every Tk value on the main thread.
+        speed = self.speed_mode_var.get() if hasattr(self, "speed_mode_var") else "Full"
+        is_fast = (speed == "Fast")
+        prep_method = self.prep_var.get()
+        feat_method_ui = self.feat_sel_var.get() if hasattr(self, "feat_sel_var") else "None"
+        full_nested_ui = self.full_nested_var.get() if hasattr(self, "full_nested_var") else False
+        sg_window, sg_poly = self._get_sg_params()
+        ui_snapshot = {
+            "is_fast": is_fast,
+            "prep_method": prep_method,
+            "feat_method": feat_method_ui,
+            "full_nested": full_nested_ui,
+            "sg_window": sg_window,
+            "sg_poly": sg_poly,
+        }
+
+        # Run on the MAIN thread. Background threads + Tkinter were unreliable
+        # on this setup (models appeared not to start after selection).
         try:
+            self._run_models_core(selected_models, ui_snapshot)
+        except Exception as e:
+            import traceback
+            messagebox.showerror("Execution Error", str(e) + "\n\n" + traceback.format_exc()[-800:])
+            self.status_var.set("Error during execution.")
+
+
+    def _run_models_core(self, selected_models, ui):
+        """Core modeling logic (runs on the main thread)."""
+        try:
+            # Use values captured on the main thread (no Tk access here)
+            is_fast = ui["is_fast"]
+            prep_method = ui["prep_method"]
+            feat_method_ui = ui["feat_method"]
+            full_nested_ui = ui["full_nested"]
+            sg_window = ui["sg_window"]
+            sg_poly = ui["sg_poly"]
+            max_comp_use = 2 if is_fast else 5
+            ipls_max_intervals = 3 if is_fast else 8
+            force_light_nested = is_fast
+
             df_X_cal = self.setup_data['df_X_cal']
             df_y_cal = self.setup_data['df_y_cal']
             val_mode = self.setup_data['val_mode']
@@ -2506,10 +2673,11 @@ class SpectralAnalyzerApp:
             X_cal_df = df_X_cal.reset_index(drop=True)
             y_cal_df = df_y_cal.reset_index(drop=True)
 
-            prep_method = self.prep_var.get()
-            sg_window, sg_poly = self._get_sg_params()
+            # prep_method, sg_window, sg_poly already taken from ui snapshot
             # Column-wise references must be estimated on training data only.
-            if prep_method in ("Mean Centering", "Multiplicative Scatter Correction (MSC)") and val_mode == "split":
+            # Mean Centering and MSC are always applied later (after feature selection)
+            # using the final training reference. Start from raw for those methods.
+            if prep_method in ("Mean Centering", "Multiplicative Scatter Correction (MSC)"):
                 X_cal_proc_df = apply_preprocessing(X_cal_df, method="Raw", sg_window=sg_window, sg_poly=sg_poly)
             else:
                 X_cal_proc_df = apply_preprocessing(X_cal_df, method=prep_method, sg_window=sg_window, sg_poly=sg_poly)
@@ -2539,21 +2707,18 @@ class SpectralAnalyzerApp:
                 common_features = [col for col in X_cal_reduced_df.columns if col in df_X_ext.columns]
                 if not common_features:
                     raise ValueError("No common features found between calibration and external test sets.")
+
+                # Restrict the calibration matrix to the features that also exist in the
+                # external set so training and test start with identical columns.
+                X_cal_reduced_df = X_cal_reduced_df.loc[:, common_features]
+                X_cal_all = X_cal_reduced_df.values
                     
                 X_ext_df = df_X_ext[common_features]
-                if prep_method == "Mean Centering":
-                    # Use the calibration mean, not the external mean.
-                    mean_cal = X_cal_df[common_features].values.mean(axis=0)
-                    X_ext_proc = pd.DataFrame(X_ext_df.values - mean_cal, columns=common_features, index=X_ext_df.index)
-                elif prep_method == "Multiplicative Scatter Correction (MSC)":
-                    # MSC reference is the calibration mean spectrum, on the same wavelengths.
-                    cal_cols = list(X_cal_df.columns)
-                    missing = [c for c in cal_cols if c not in df_X_ext.columns]
-                    if missing:
-                        raise ValueError("External file is missing calibration wavelengths required for MSC.")
-                    ref = X_cal_df[cal_cols].values.mean(axis=0)
-                    ext_msc = apply_msc(df_X_ext[cal_cols].values.astype(float), ref)
-                    X_ext_proc = pd.DataFrame(ext_msc, columns=cal_cols).loc[:, common_features]
+                # For Mean Centering and MSC the correct reference is applied later,
+                # after feature selection, so we keep the raw matrix here.
+                # Row-wise methods are applied now (no leakage).
+                if prep_method in ("Mean Centering", "Multiplicative Scatter Correction (MSC)"):
+                    X_ext_proc = X_ext_df.copy()
                 else:
                     X_ext_proc = apply_preprocessing(X_ext_df, method=prep_method, sg_window=sg_window, sg_poly=sg_poly)
                 X_test_fixed = X_ext_proc[common_features].values
@@ -2562,16 +2727,15 @@ class SpectralAnalyzerApp:
 
             model_keys = selected_models
 
-            for item in self.tree.get_children():
-                self.tree.delete(item)
+            # Clear previous results on the main thread (Tkinter is not thread-safe)
+            [self.tree.delete(i) for i in self.tree.get_children()]
 
             self.detailed_results = {}
             rows = []
             equations_report = []
 
             for idx_m, name in enumerate(model_keys):
-                self.status_var.set(f"Training model {idx_m+1}/{len(model_keys)}: {name} ...")
-                self.root.update_idletasks()
+                self.status_var.set(f"Training model {idx_m+1}/{len(model_keys)}: {name} ..."); self.root.update_idletasks()
                 acc_r2_train, acc_r2_adj, acc_rmsec, acc_q2_cv, acc_r2_ext, acc_ccc_ext, acc_rmsep, acc_rpd_ext = [], [], [], [], [], [], [], []
                 
                 last_y_train, last_y_test, last_y_hat_train, last_y_hat_ext = None, None, None, None
@@ -2586,8 +2750,7 @@ class SpectralAnalyzerApp:
 
                 for rep in range(n_repeats):
                     if n_repeats > 1:
-                        self.status_var.set(f"Training {name} — repeat {rep+1}/{n_repeats}")
-                        self.root.update_idletasks()
+                        self.status_var.set(f"Training {name} — repeat {rep+1}/{n_repeats}"); self.root.update_idletasks()
                     seed = 42 + rep
                     mean_train = None
                     ref = None
@@ -2606,17 +2769,9 @@ class SpectralAnalyzerApp:
                         train_sample_ids = cal_sample_ids[train_idx]
                         test_sample_ids = cal_sample_ids[test_idx]
                         
-                        # Apply Mean Centering using training mean only (correct, no leakage)
-                        if prep_method == "Mean Centering":
-                            mean_train = np.mean(X_train, axis=0, keepdims=True)
-                            X_train = X_train - mean_train
-                            X_test = X_test - mean_train
-                        elif prep_method == "Multiplicative Scatter Correction (MSC)":
-                            ref = np.mean(X_train, axis=0)
-                            X_train = apply_msc(X_train, ref)
-                            X_test = apply_msc(X_test, ref)
-
                         # Collinearity from the training block only.
+                        # (Mean Centering / MSC are applied AFTER final feature selection
+                        #  so that the stored reference matches the exact columns used by the model.)
                         if do_collinear:
                             train_df = pd.DataFrame(X_train, columns=X_cal_reduced_df.columns)
                             train_df, _dropped = eliminate_collinearity(train_df, threshold_pct=collinear_thresh, y=y_train)
@@ -2629,22 +2784,36 @@ class SpectralAnalyzerApp:
                         else:
                             split_feature_names = X_cal_reduced_df.columns
 
+                        # Remember the column list before advanced feature selection
+                        # (used later for full-spectrum row-wise preprocessing at prediction time)
+                        original_feature_names = list(split_feature_names)
+
                         # Optional advanced feature / wavelength selection (training only)
-                        feat_method = getattr(self, 'feat_sel_var', None)
-                        feat_method = feat_method.get() if feat_method is not None else "None"
+                        feat_method = feat_method_ui
                         if feat_method != "None" and X_train.shape[1] > 5:
                             if feat_method == "VIP (PLS)":
                                 mask, _ = select_features_by_vip(X_train, y_train, max_features=min(80, X_train.shape[1]))
                             elif feat_method == "Correlation":
                                 mask, _ = select_features_by_correlation(X_train, y_train, max_features=min(80, X_train.shape[1]))
                             elif feat_method == "Interval (iPLS-style)":
-                                mask, _ = select_features_interval(X_train, y_train, interval_width=max(5, X_train.shape[1]//20))
+                                mask, _ = select_features_interval(X_train, y_train, interval_width=max(5, X_train.shape[1]//20), max_intervals=ipls_max_intervals)
                             else:
                                 mask = np.ones(X_train.shape[1], dtype=bool)
                             if mask.sum() >= 2:
                                 X_train = X_train[:, mask]
                                 X_test = X_test[:, mask]
                                 split_feature_names = split_feature_names[mask]
+
+                        # Apply Mean Centering / MSC AFTER final feature selection so the
+                        # stored reference has exactly the same length as the model features.
+                        if prep_method == "Mean Centering":
+                            mean_train = np.mean(X_train, axis=0, keepdims=True)
+                            X_train = X_train - mean_train
+                            X_test = X_test - mean_train
+                        elif prep_method == "Multiplicative Scatter Correction (MSC)":
+                            ref = np.mean(X_train, axis=0)
+                            X_train = apply_msc(X_train, ref)
+                            X_test = apply_msc(X_test, ref)
                     else:
                         X_train = X_cal_all
                         y_train = y_cal_all
@@ -2653,54 +2822,88 @@ class SpectralAnalyzerApp:
                         y_test = y_test_fixed
                         test_sample_ids = test_sample_ids_fixed
                         split_feature_names = X_cal_reduced_df.columns
+                        original_feature_names = list(split_feature_names)
                         # Feature selection on calibration (training) only, then apply identical mask to external test
-                        feat_method = self.feat_sel_var.get() if hasattr(self, 'feat_sel_var') else "None"
+                        feat_method = feat_method_ui
                         if feat_method != "None" and X_train.shape[1] > 5:
                             if feat_method == "VIP (PLS)":
                                 mask, _ = select_features_by_vip(X_train, y_train, max_features=min(80, X_train.shape[1]))
                             elif feat_method == "Correlation":
                                 mask, _ = select_features_by_correlation(X_train, y_train, max_features=min(80, X_train.shape[1]))
                             elif feat_method == "Interval (iPLS-style)":
-                                mask, _ = select_features_interval(X_train, y_train, interval_width=max(5, X_train.shape[1]//20))
+                                mask, _ = select_features_interval(X_train, y_train, interval_width=max(5, X_train.shape[1]//20), max_intervals=ipls_max_intervals)
                             else:
                                 mask = np.ones(X_train.shape[1], dtype=bool)
                             if int(mask.sum()) >= 2 and mask.shape[0] == X_train.shape[1]:
                                 X_train = X_train[:, mask]
+                                kept_names = list(split_feature_names[mask])
+                                # Apply the identical feature selection to the external test set.
                                 if X_test.shape[1] == mask.shape[0]:
                                     X_test = X_test[:, mask]
                                 else:
-                                    # Align by feature names if column count differs
-                                    kept_names = [split_feature_names[i] for i in range(len(mask)) if mask[i]]
-                                    # Rebuild test from original external processed matrix if needed
-                                    pass
-                                split_feature_names = split_feature_names[mask]
+                                    # Column counts differ (should be rare after the earlier
+                                    # common-feature alignment). Select by name from the
+                                    # already-processed external matrix, which keeps its
+                                    # original column labels.
+                                    if isinstance(X_ext_proc, pd.DataFrame):
+                                        available = [c for c in kept_names if c in X_ext_proc.columns]
+                                        if len(available) < 2:
+                                            raise ValueError(
+                                                "Feature selection produced columns that are not present "
+                                                "in the external test set."
+                                            )
+                                        X_test = X_ext_proc[available].values
+                                        kept_names = available
+                                    else:
+                                        raise ValueError(
+                                            "Cannot align external test features after selection "
+                                            "(processed external matrix unavailable)."
+                                        )
+                                split_feature_names = kept_names
+                                if X_train.shape[1] != X_test.shape[1]:
+                                    raise ValueError(
+                                        "After feature selection the training and external test "
+                                        "matrices have different numbers of columns."
+                                    )
+
+                        # Apply Mean Centering / MSC AFTER final feature selection
+                        # (external mode). Reference is computed on the final selected
+                        # calibration features only.
+                        if prep_method == "Mean Centering":
+                            mean_train = np.mean(X_train, axis=0, keepdims=True)
+                            X_train = X_train - mean_train
+                            X_test = X_test - mean_train
+                        elif prep_method == "Multiplicative Scatter Correction (MSC)":
+                            ref = np.mean(X_train, axis=0)
+                            X_train = apply_msc(X_train, ref)
+                            X_test = apply_msc(X_test, ref)
 
                     if name == "PLSR (5 LV max)":
-                        best_nc = select_best_n_components("PLSR", X_train, y_train, max_comp=5, seed=seed)
+                        best_nc = select_best_n_components("PLSR", X_train, y_train, max_comp=max_comp_use, seed=seed)
                         model = SafePLSRegression(max_components=best_nc)
                         chosen_alpha = None
                         chosen_nc = best_nc
                         chosen_tree = None
                     elif name == "PCR (5 PC + OLS)":
-                        best_nc = select_best_n_components("PCR", X_train, y_train, max_comp=5, seed=seed)
+                        best_nc = select_best_n_components("PCR", X_train, y_train, max_comp=max_comp_use, seed=seed)
                         model = PipelinePCARegression(max_components=best_nc)
                         chosen_alpha = None
                         chosen_nc = best_nc
                         chosen_tree = None
                     elif name == "Ridge":
-                        best_a = select_best_alpha("Ridge", X_train, y_train, seed=seed)
+                        best_a = select_best_alpha("Ridge", X_train, y_train, seed=seed, fast=is_fast)
                         model = Ridge(alpha=best_a)
                         chosen_alpha = best_a
                         chosen_nc = None
                         chosen_tree = None
                     elif name == "Lasso":
-                        best_a = select_best_alpha("Lasso", X_train, y_train, seed=seed)
+                        best_a = select_best_alpha("Lasso", X_train, y_train, seed=seed, fast=is_fast)
                         model = Lasso(alpha=best_a, max_iter=10000)
                         chosen_alpha = best_a
                         chosen_nc = None
                         chosen_tree = None
                     elif name == "ElasticNet":
-                        best_a = select_best_alpha("ElasticNet", X_train, y_train, seed=seed)
+                        best_a = select_best_alpha("ElasticNet", X_train, y_train, seed=seed, fast=is_fast)
                         model = ElasticNet(alpha=best_a, l1_ratio=0.5, max_iter=10000)
                         chosen_alpha = best_a
                         chosen_nc = None
@@ -2813,7 +3016,7 @@ class SpectralAnalyzerApp:
                         p_vars = len(feature_names)  # for reference only
 
                     # Nested Q² (full or light depending on user toggle)
-                    full_nested = self.full_nested_var.get() if hasattr(self, 'full_nested_var') else False
+                    full_nested = False if force_light_nested else full_nested_ui
                     q2_cv = evaluate_q2_cv(name, Xtr_raw, y_train, cv_folds=5, seed=seed,
                                            alpha=None, n_components=None,
                                            tree_params=chosen_tree, full_nested=full_nested)
@@ -2904,6 +3107,7 @@ class SpectralAnalyzerApp:
                             'chosen_tree': chosen_tree,
                             'msc_reference': ref.copy() if ref is not None else None,
                             'mean_centering_mean': mean_train.ravel().copy() if mean_train is not None else None,
+                            'original_feature_names': original_feature_names,
                             'n_outliers': n_outliers,
                             # Metrics of this specific (best) repeat — these match the stored predictions
                             'r2_train': r2_train, 'r2_adj': r2_adj, 'rmsec': rmsec,
@@ -2988,18 +3192,50 @@ class SpectralAnalyzerApp:
                     'chosen_n_components': best_details.get('chosen_n_components') if best_details else None,
                     'chosen_tree': best_details.get('chosen_tree') if best_details else None,
                     'msc_reference': best_details.get('msc_reference') if best_details else None,
-                    'mean_centering_mean': best_details.get('mean_centering_mean') if best_details else None
+                    'mean_centering_mean': best_details.get('mean_centering_mean') if best_details else None,
+                    'original_feature_names': best_details.get('original_feature_names') if best_details else None
                 }
 
                 r2_adj_str = f"{r2_adj:.4f}" if not np.isnan(r2_adj) else "N/A"
                 rows.append((name, f"{r2_train:.4f}", r2_adj_str, f"{rmsec:.4f}", f"{q2_cv:.4f}",
                              f"{r2_ext:.4f}", f"{ccc_ext:.4f}", f"{rmsep:.4f}", f"{rpd_ext:.3f}", status))
 
-                eq_str_parts = [f"{last_intercept:+.4f}"]
-                for f_name, c in zip(last_feature_names, last_coefs):
-                    if abs(c) > 1e-6:
-                        eq_str_parts.append(f"{c:+.4f}*({f_name})")
-                full_eq = f"y = " + " ".join(eq_str_parts[:40])
+                # Build equation or importance summary depending on model type
+                linear_models = ["PLSR (5 LV max)", "PCR (5 PC + OLS)", "Ridge", "Lasso", "ElasticNet", "Stepwise MLR"]
+                is_linear = name in linear_models
+
+                if is_linear:
+                    eq_str_parts = [f"{last_intercept:+.4f}"]
+                    for f_name, c in zip(last_feature_names, last_coefs):
+                        if abs(c) > 1e-6:
+                            eq_str_parts.append(f"{c:+.4f}*({f_name})")
+                    full_eq = "y = " + " ".join(eq_str_parts[:40])
+                    if len(eq_str_parts) > 40:
+                        full_eq += " ... (truncated)"
+                else:
+                    # Non-linear models: do not fabricate a linear equation
+                    if (last_coefs is not None and len(last_coefs) > 0 and
+                            np.any(np.abs(last_coefs) > 1e-6) and
+                            any(x in name for x in ("Random Forest", "Extra Trees", "Gradient Boosting"))):
+                        top_n = min(10, len(last_coefs))
+                        top_idx = np.argsort(np.abs(last_coefs))[-top_n:][::-1]
+                        imp_parts = [
+                            f"{last_feature_names[i]}: {last_coefs[i]:.4f}"
+                            for i in top_idx if abs(last_coefs[i]) > 1e-6
+                        ]
+                        full_eq = (
+                            "Non-linear model (no closed-form linear equation).\n"
+                            "Top feature importances (from best repeat):\n  " +
+                            "\n  ".join(imp_parts) if imp_parts else
+                            "Non-linear model (no closed-form linear equation).\n"
+                            "No meaningful feature importances available."
+                        )
+                    else:
+                        full_eq = (
+                            "Non-linear model (no closed-form linear equation).\n"
+                            "Feature importances not directly available for this model type.\n"
+                            "Use the SHAP figure or the Feature Importances export for interpretation."
+                        )
 
                 note_repeats = ""
                 best_note = ""
@@ -3007,7 +3243,7 @@ class SpectralAnalyzerApp:
                     note_repeats = (
                         "\nNOTE: The results table shows AVERAGED metrics across all random-split repeats.\n"
                         f"Standard deviations: R²_Ext ± {r2_ext_std:.4f}, RMSEP ± {rmsep_std:.4f}, CCC ± {ccc_ext_std:.4f}, RPD ± {rpd_ext_std:.3f}.\n"
-                        "The regression equation, coefficients, sample IDs, stored predictions, Golbraikh-Tropsha\n"
+                        "The model summary (equation or importances), coefficients/importances, sample IDs, stored predictions, Golbraikh-Tropsha\n"
                         "status and the values shown below under 'Best-repeat metrics' come from the single BEST\n"
                         "repeat (highest external R²). Plot statistics are always recomputed from the points shown.\n"
                     )
@@ -3032,9 +3268,10 @@ class SpectralAnalyzerApp:
                 stepwise_note = ""
                 if "Stepwise" in name:
                     stepwise_note = (
-                        "\nNOTE (Stepwise MLR): Forward-backward selection with BIC early-stopping, "
-                        "stricter p-enter and tighter variable caps on small n. "
-                        "Still less stable than ElasticNet/PLSR when n is very small — compare both.\n"
+                        "\nNOTE (Stepwise MLR): Stabilized forward-backward selection. "
+                        "On n < 50 a variable is added only if it improves BIC (extra penalty) "
+                        "AND a quick internal CV Q². Caps are strict (max 2 vars below n=30). "
+                        "ElasticNet/PLSR remain preferable on very small samples — compare them.\n"
                     )
 
                 r2_adj_disp = f"{r2_adj:.4f}" if not np.isnan(r2_adj) else "N/A"
@@ -3065,25 +3302,26 @@ class SpectralAnalyzerApp:
                     f"=> REASON / DIAGNOSTIC EXPLANATION:\n"
                     f"   {('All external validation conditions met.' if gt['passed'] else 'Model failed Tropsha criteria; check collinearity & scaling settings.')}\n"
                     f"--------------------------------------------------------------------------------\n"
-                    f"REGRESSION EQUATION / SUMMARY (from best repeat):\n{full_eq}\n"
+                    f"EQUATION / MODEL SUMMARY (from best repeat):\n{full_eq}\n"
                     f"{best_note}{note_repeats}{note_nonlinear}{stepwise_note}{outlier_note}"
                     f"================================================================================\n\n"
                 )
 
             for r in rows:
                 self.tree.insert("", tk.END, values=r)
-
             self.eq_text.config(state=tk.NORMAL)
             self.eq_text.delete(1.0, tk.END)
             self.eq_text.insert(tk.END, "".join(equations_report))
             self.eq_text.config(state=tk.DISABLED)
-
             self.status_var.set("Models trained successfully with valid cross-validation & statistics!")
             self._log(f"Models finished: {list(self.detailed_results.keys())}")
+            self.root.update_idletasks()
 
         except Exception as e:
+            import traceback
+            import traceback
             self.status_var.set("Error during execution.")
-            messagebox.showerror("Execution Error", str(e))
+            messagebox.showerror("Execution Error", str(e) + "\n\n" + traceback.format_exc()[-700:])
 
     def generate_shap_plot(self):
         """Generates SHAP figure with full dimension safety."""
@@ -3357,20 +3595,51 @@ class SpectralAnalyzerApp:
                 pd.DataFrame(methods_rows).to_excel(writer, sheet_name="Methods", index=False)
 
                 equations_data = []
+                linear_models = ["PLSR (5 LV max)", "PCR (5 PC + OLS)", "Ridge", "Lasso", "ElasticNet", "Stepwise MLR"]
                 for name, res in self.detailed_results.items():
                     intercept = res['intercept']
                     feat_names = res['feature_names']
                     coefs = res['coefficients']
-                    eq_parts = [f"{intercept:+.4f}"]
-                    for f_name, c in zip(feat_names, coefs):
-                        if abs(c) > 1e-6:
-                            eq_parts.append(f"{c:+.4f}*({f_name})")
-                    full_eq = "y = " + " ".join(eq_parts)
-                    
+                    is_linear = name in linear_models
+
+                    if is_linear:
+                        eq_parts = [f"{intercept:+.4f}"]
+                        for f_name, c in zip(feat_names, coefs):
+                            if abs(c) > 1e-6:
+                                eq_parts.append(f"{c:+.4f}*({f_name})")
+                        full_eq = "y = " + " ".join(eq_parts)
+                        if len(eq_parts) > 40:
+                            full_eq += " ... (truncated)"
+                        eq_type = "Linear equation"
+                    else:
+                        # Non-linear: store a note + top importances when available
+                        if (coefs is not None and len(coefs) > 0 and
+                                np.any(np.abs(coefs) > 1e-6) and
+                                any(x in name for x in ("Random Forest", "Extra Trees", "Gradient Boosting"))):
+                            top_n = min(10, len(coefs))
+                            top_idx = np.argsort(np.abs(coefs))[-top_n:][::-1]
+                            imp_parts = [
+                                f"{feat_names[i]}: {coefs[i]:.4f}"
+                                for i in top_idx if abs(coefs[i]) > 1e-6
+                            ]
+                            full_eq = (
+                                "Non-linear model (no closed-form equation). "
+                                "Top feature importances: " + "; ".join(imp_parts)
+                            )
+                        else:
+                            full_eq = (
+                                "Non-linear model (no closed-form equation). "
+                                "See Feature_Importances sheet or SHAP for interpretation."
+                            )
+                        eq_type = "Non-linear (importances / note)"
+
                     gt = res['gt']
                     equations_data.append({
-                        "Model": name, "Preprocessing": res['preprocessing'], "Intercept": intercept,
-                        "Equation": full_eq, "Observations_n": res['n_obs'], "Active_Variables_p": res['p_vars'],
+                        "Model": name, "Preprocessing": res['preprocessing'],
+                        "Equation_Type": eq_type,
+                        "Intercept": intercept if is_linear else None,
+                        "Equation_or_Summary": full_eq,
+                        "Observations_n": res['n_obs'], "Active_Variables_p": res['p_vars'],
                         "Std_Error_s": res['std_err'], "F_Statistic": res['f_stat'],
                         "R2_Train": res['r2_train'], "R2_Validation": res['r2_ext'],
                         "RMSEP": res['rmsep'], "RPD_Validation": res['rpd_ext'],
@@ -3508,12 +3777,7 @@ class SpectralAnalyzerApp:
             "and export of full Excel reports.\n\n"
             "Developed by Dr. Abdelhalim Khaled\n"
             "Plant Ecophysiology\n"
-            "University of Concepción\n\n"
-            "Citation:\n"
-            "Khaled, A. (2026). Spectral Analyzer Pro: A desktop application for\n"
-            "chemometrics and QSAR analysis of spectral data.\n"
-            "University of Concepción.\n"
-            "https://github.com/elazabemah-commits/Spectral-Analyzer-Pro"
+            "University of Concepción"
         )
         messagebox.showinfo("About Spectral Analyzer Pro", about_text, parent=self.root)
 
@@ -3917,7 +4181,8 @@ class SpectralAnalyzerApp:
                     sg_window=res.get('sg_window', 15),
                     sg_poly=res.get('sg_poly', 2),
                     msc_reference=res.get('msc_reference'),
-                    mean_centering_mean=res.get('mean_centering_mean')
+                    mean_centering_mean=res.get('mean_centering_mean'),
+                    original_feature_names=res.get('original_feature_names')
                 )
                 payload = {
                     'pipeline': pipeline,
